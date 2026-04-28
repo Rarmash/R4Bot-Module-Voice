@@ -1,6 +1,9 @@
-﻿from datetime import datetime
+from datetime import datetime
 
+import discord
 from discord.ext import commands, tasks
+
+from .service import VoiceService
 
 
 def is_voice_activity_counted(voice_state) -> bool:
@@ -15,24 +18,54 @@ def is_voice_activity_counted(voice_state) -> bool:
     )
 
 
+def format_voice_duration(total_seconds):
+    hours, remainder = divmod(int(total_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ч {minutes} м"
+    if minutes:
+        return f"{minutes} м {seconds} с"
+    return f"{seconds} с"
+
+
+def generate_voice_leaderboard_lines(data_list):
+    def get_place_icon(index):
+        if index == 0:
+            return "🥇"
+        if index == 1:
+            return "🥈"
+        if index == 2:
+            return "🥉"
+        return f"{index + 1}."
+
+    return "\n".join(
+        f"{get_place_icon(index)} <@{user[0]}>: {format_voice_duration(user[1])}"
+        for index, user in enumerate(data_list[:10])
+    )
+
+
 class Voice(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.services = getattr(bot, 'r4_services', None)
+        self.services = getattr(bot, "r4_services", None)
         if self.services is None:
-            raise RuntimeError('R4Bot runtime services are not available on bot.r4_services')
+            raise RuntimeError("R4Bot runtime services are not available on bot.r4_services")
+
         self.active_sessions = {}
+        self.service = VoiceService(self)
+        self.service.register_hooks()
         self.flush_voice_time.start()
 
     def cog_unload(self):
+        self.service.unregister_hooks()
         self.flush_voice_time.cancel()
 
     def _get_session_key(self, guild_id: int, user_id: int):
-        return f'{guild_id}:{user_id}'
+        return f"{guild_id}:{user_id}"
 
     def _iter_session_parts(self):
         for session_key, started_at in self.active_sessions.items():
-            guild_id, user_id = session_key.split(':', 1)
+            guild_id, user_id = session_key.split(":", 1)
             yield int(guild_id), int(user_id), started_at
 
     def _start_session(self, guild_id: int, user_id: int):
@@ -47,17 +80,55 @@ class Voice(commands.Cog):
 
         guild_key = str(guild_id)
         user_key = str(user_id)
-        user_record = self.services.firebase.get_from_record(guild_key, 'Users', user_key)
+        user_record = self.services.firebase.get_from_record(guild_key, "Users", user_key)
         if user_record is None:
-            self.services.firebase.create_record(guild_key, 'Users', user_key, {'messages': 0, 'timeouts': 0, 'voice': seconds})
+            self.services.firebase.create_record(
+                guild_key,
+                "Users",
+                user_key,
+                {"messages": 0, "timeouts": 0, "voice": seconds},
+            )
             return
 
-        self.services.firebase.update_record(guild_key, 'Users', user_key, {'voice': user_record.get('voice', 0) + seconds})
+        self.services.firebase.update_record(
+            guild_key,
+            "Users",
+            user_key,
+            {"voice": user_record.get("voice", 0) + seconds},
+        )
 
     def _flush_session(self, guild_id: int, user_id: int, started_at: datetime):
         elapsed_seconds = int((datetime.utcnow() - started_at).total_seconds())
         self._add_voice_time(guild_id, user_id, elapsed_seconds)
         self._start_session(guild_id, user_id)
+
+    async def show_voice_leaderboard(self, ctx, server_data):
+        users = self.services.firebase.get_all_records(str(ctx.guild.id), "Users") or {}
+        leaderboard = [
+            [user_id, user_data.get("voice", 0)]
+            for user_id, user_data in users.items()
+            if user_data.get("voice", 0) > 0
+        ]
+        leaderboard.sort(key=lambda items: items[1], reverse=True)
+
+        total_voice_seconds = sum(user[1] for user in leaderboard)
+        embed = discord.Embed(
+            title="Лидеры по голосовой активности",
+            description=generate_voice_leaderboard_lines(leaderboard),
+            color=int(server_data.get("accent_color"), 16),
+        )
+
+        author_id = str(ctx.author.id)
+        author_position = next((index for index, user in enumerate(leaderboard) if user[0] == author_id), None)
+        if author_position is not None and author_position >= 10:
+            user = leaderboard[author_position]
+            embed.add_field(
+                name="Ваше положение в таблице",
+                value=f"{author_position + 1}. <@{user[0]}>: {format_voice_duration(user[1])}\n",
+            )
+
+        embed.set_footer(text=f"Всего наговорено {format_voice_duration(total_voice_seconds)}")
+        await ctx.respond(embed=embed)
 
     @tasks.loop(seconds=30)
     async def flush_voice_time(self):
